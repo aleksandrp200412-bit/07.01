@@ -2,6 +2,7 @@ import logging
 import sqlite3
 import asyncio
 import io
+import os
 import random
 import html
 from datetime import datetime, timedelta
@@ -16,7 +17,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import aiosqlite
 
 # --- КОНФИГУРАЦИЯ ---
-API_TOKEN = '8643008402:AAFMXNMRVF6mlG2DDcycgiCvV-a-4VbnQA4'
+API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+
+if not API_TOKEN:
+    raise RuntimeError(
+        "Не найден BOT_TOKEN или TELEGRAM_BOT_TOKEN в переменных окружения."
+    )
 ADMIN_ID = 5127534911
 COMMON_WAREHOUSE = -1003837122752
 LOGS_CHAT_ID = -5202749474
