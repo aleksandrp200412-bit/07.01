@@ -76,7 +76,6 @@ def init_dbs():
     except:
         pass
         
-    # Новая таблица для хранения серий огоньков (обновленная схема с biz_conn_id)
     c.execute('''CREATE TABLE IF NOT EXISTS fire_series (
         chat_id INTEGER,
         user_a_id INTEGER,
@@ -197,7 +196,7 @@ def check_access(user_id):
 def get_msg(msg_id, chat_id):
     conn = sqlite3.connect('spy_bot.db')
     c = conn.cursor()
-    c.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ?",
+    c.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ? LIMIT 1",
               (msg_id, chat_id))
     res = c.fetchone()
     conn.close()
@@ -239,7 +238,7 @@ FIRE_PHRASES = [
     "Этот чат заслуживает отдельной премии.", "Вы согреваете мне душу (если бы она у меня была).", "Прекрасный день для продолжения серии!",
     "Магия общения в действии.", "Один пропуск — и я стираю вашу историю сообщений.", "Только попробуйте забыть написать завтра.",
     "Я считаю секунды до вашего ответа.", "Моё терпение не бесконечно, в отличие от этого счётчика.", "Не заставляйте меня использовать `.умри` самостоятельно.",
-    "Ещё один день тишины, и я уйду к другим админам.", "Я слежу за тобой. И за твоим собеседником тоже.", "Кто-то играет с огнём... и этот кто-то — вы.",
+    "Ещё один день тишины, и я уйду к другим админам.", "Я слежу за тобой. И за твоим собеседником тоже.", "Кто-нибудь, играет с огнём... и этот кто-то — вы.",
     "Мой фитиль уже дымился, но вы успели.", "Не доводите огонёк до депрессии.", "И жили они долго и счастливо, пока не забыли зайти в чат...",
     "Легенда гласит, что эта серия никогда не кончится.", "Вы в шаге от рекорда (какого — я ещё не придумал).", "Просто оставлю это здесь: вы крутые.",
     "Серия продолжается, шоу маст гоу он!", "Блять, вы общаетесь так, будто один из вас держит другого в заложниках.",
@@ -357,7 +356,7 @@ async def cb_menu_fire_series(call: types.CallbackQuery):
     fire_text = (
         "🔥 <b>Серии (огонёк) за общение</b>\n\n"
         "Переписывайтесь хотя бы раз в 2 дня, и серия растёт. Пропустите — огонёк сгорит. "
-        "Можно восстановить до 6 раз, если одновременно написать <code>.живи</code>\n\n"
+        "Можно恢复новить до 6 раз, если одновременно написать <code>.живи</code>\n\n"
         "➡️ <b>Как начать:</b> отправьте другу команду <code>.огонь</code> — как только он нажмёт «Принять», огонёк зажжётся."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1141,7 +1140,7 @@ async def handle_new(message: types.Message):
                         almost_dead_time = (datetime.now() - timedelta(hours=45)).isoformat()
                         conn = sqlite3.connect('spy_bot.db')
                         c = conn.cursor()
-                        c.execute("UPDATE fire_series SET last_activity = ? WHERE chat_id = ?", (almost_dead_time, message.chat.id))
+                        c.execute("UPDATE fire_series SET last_activity = ? WHERE chat_id = ?", (message.chat.id,))
                         conn.commit()
                         conn.close()
                         await bot.send_message(
@@ -1449,7 +1448,7 @@ async def handle_new(message: types.Message):
         else:
             dest = f"@{conn_info.user.username}" if conn_info.user.username else conn_info.user.full_name
 
-        log_header = f"{from_name} {from_tag}{dest}"
+        log_header = f"{from_name} {from_tag} -> {dest}"
         sender_is_also_owner = (message.from_user.id != owner_id and _is_bot_owner(message.from_user.id))
 
         is_vanishing = bool(
@@ -1539,9 +1538,10 @@ async def handle_new(message: types.Message):
 
         conn = sqlite3.connect('spy_bot.db')
         c = conn.cursor()
+        # Вместо "[Медиа]" пишем в базу пустую строку, если текста нет, чтобы не засорять логи заглушками
         c.execute("INSERT OR REPLACE INTO messages_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                   (message.message_id, owner_id, message.chat.id, message.from_user.id, from_name, from_tag,
-                   msg_text if msg_text else "[Медиа]", arch_id, datetime.now().isoformat()))
+                   msg_text, arch_id, datetime.now().isoformat()))
         conn.commit()
         conn.close()
     except:
@@ -1567,7 +1567,7 @@ async def handle_edit(edited_msg: types.Message):
             is_media = bool(edited_msg.photo or edited_msg.video or edited_msg.document or edited_msg.video_note or edited_msg.voice or edited_msg.audio or edited_msg.sticker or edited_msg.animation)
 
             if is_media:
-                old_caption = html.escape(old_text) if old_text and old_text != "[Медиа]" else ""
+                old_caption = html.escape(old_text) if old_text else ""
                 new_caption = html.escape(edited_msg.caption or "")
                 caption_diff = ""
                 if old_caption or new_caption:
@@ -1583,13 +1583,12 @@ async def handle_edit(edited_msg: types.Message):
                         await bot.copy_message(chat_id=owner_id, from_chat_id=COMMON_WAREHOUSE, message_id=old_arch_id, caption=full_caption, parse_mode="HTML")
                     except Exception:
                         try:
-                            # Прямой форвард из архива, если Telegram не дает скопировать
                             copied = await bot.forward_message(chat_id=owner_id, from_chat_id=COMMON_WAREHOUSE, message_id=old_arch_id)
                             await bot.send_message(owner_id, full_caption, reply_to_message_id=copied.message_id, parse_mode="HTML")
                         except Exception:
-                            await bot.send_message(owner_id, f"{header}\n\n<b>Было:</b> [медиа]{caption_diff}", parse_mode="HTML")
+                            await bot.send_message(owner_id, f"{header}{caption_diff}", parse_mode="HTML")
                 else:
-                    await bot.send_message(owner_id, f"{header}\n\n<b>Было:</b> [медиа]{caption_diff}", parse_mode="HTML")
+                    await bot.send_message(owner_id, f"{header}{caption_diff}", parse_mode="HTML")
 
                 try:
                     new_arch_id = None
@@ -1623,7 +1622,7 @@ async def handle_edit(edited_msg: types.Message):
                     pass
 
             else:
-                new_text = html.escape(edited_msg.text or edited_msg.caption or "[Медиа]")
+                new_text = html.escape(edited_msg.text or edited_msg.caption or "")
                 old_text_esc = html.escape(old_text or "")
                 report = (f"{header}\n\n"
                           f"<b>Было:</b>\n<blockquote>{old_text_esc}</blockquote>\n"
@@ -1753,7 +1752,7 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
             buf.write(f"📁 История удалённого чата\n{'=' * 40}\n\n")
             for from_name, from_tag, text, date in all_msgs:
                 tag_str = f" {from_tag}" if from_tag else ""
-                buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[медиа]'}\n\n")
+                buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[Медиа файл]'}\n\n")
             buf.seek(0)
             file_obj = types.BufferedInputFile(buf.getvalue().encode("utf-8"), filename="deleted_chat.txt")
             try:
@@ -1777,26 +1776,34 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
             user_info = f"👤 <b>{safe_name}</b> {safe_tag} удалил(а) сообщение:"
             
             if arch_id:
-                caption_text = user_info
-                if text and text != "[Медиа]":
-                    caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
-                
+                # 100% НАДЕЖНАЯ ПЕРЕСЫЛКА МЕДИА: Разделяем заголовок и файл на случай типов данных без поддержки caption (кружки, стикеры)
                 try:
-                    if len(caption_text) > 1024:
-                        raise ValueError("too long")
+                    caption_text = user_info
+                    if text:
+                        caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
+                    
+                    # Пытаемся скопировать с текстом сразу
                     await bot.copy_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id, caption=caption_text, parse_mode="HTML")
                 except Exception:
+                    # Если падает из-за типа медиа, отправляем сначала сам файл, а затем текстовый лог
                     try:
-                        # Прямой форвард из архива, если Telegram не дает скопировать
-                        copied = await bot.forward_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id)
-                        await bot.send_message(owner_id2, caption_text, reply_to_message_id=copied.message_id, parse_mode="HTML")
+                        await bot.copy_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id)
+                        caption_text = user_info
+                        if text:
+                            caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
+                        await bot.send_message(owner_id2, caption_text, parse_mode="HTML")
                     except Exception:
-                        await bot.send_message(owner_id2, f"{caption_text}\n<i>[Медиа скрыто или недоступно]</i>", parse_mode="HTML")
+                        # Финальный фолбек на случай непредвиденных проблем с архивом
+                        caption_text = user_info
+                        if text:
+                            caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
+                        await bot.send_message(owner_id2, caption_text, parse_mode="HTML")
             elif text:
                 if text.strip().startswith('.'): 
                     continue
                 await bot.send_message(owner_id2, f"{user_info}\n\n<blockquote>{html.escape(text)}</blockquote>", parse_mode="HTML")
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error in handle_delete for msg {msg_id}: {e}")
             pass
 
 
@@ -2109,24 +2116,17 @@ async def cb_choose_period(call: types.CallbackQuery, state: FSMContext):
             f"{'⛔ Остановлено' if stopped_early else '✅ Готово'}. Отправлено: {sent}/{len(messages)}"
         )
         await status_msg.edit_text(
-            f"{'⛔ Трансляция остановлена' if stopped_early else '✅ Трансляция завершена'}! "
-            f"{sent}/{len(messages)} сообщений.",
-            reply_markup=None
+            f"{'⛔ Трансляция остановлена' if stopped_early else '✅ Трансляция завершена'}."
         )
-    
-    await call.answer()
 
 
-# --- ЗАПУСК ---
+# --- ТОЧКА ВХОДА СЛУЖБ БОТА ---
 async def main():
     init_dbs()
-    asyncio.create_task(send_weekly_stats())
     asyncio.create_task(check_fire_status_loop())
+    asyncio.create_task(send_weekly_stats())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    import sys
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
