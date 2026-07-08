@@ -1739,46 +1739,83 @@ async def send_weekly_stats():
 #     (сообщение исчезло и у нас) -> уведомляем владельца этого подключения.
 #   * Собеседник очистил/удалил чат «у себя» -> событие приходит ТОЛЬКО в его
 #     подключение (у нас чат остаётся) -> уведомить нас можно, только если собеседник
-#     тоже подключил бота. Тогда, поймав полную очистку у одного участника, уведомляем
-#     ДРУГОГО участника (второго владельца) и отдаём ему его же копию переписки.
-async def _notify_peer_chat_cleared(actor_id, peer_id, actor_name, actor_tag):
-    # actor_id очистил свой чат с peer_id. Уведомляем собеседника peer_id, если он тоже
-    # подключил бота (его записи: owner_id = peer_id, chat_id = actor_id).
-    if not check_access(peer_id):
-        return
-    if is_ignored(peer_id, actor_id): return
-    if is_liza_blocked(peer_id): return
-    if is_user_blocked(peer_id, actor_id): return
-    if is_fuck_blocked(peer_id, actor_id): return
+#     тоже подключил бота. Поймав полную очистку у одного участника, уведомляем ОБОИХ
+#     (у кого подключён бот): второму участнику — что собеседник удалил чат, самому
+#     удалившему — резервную копию переписки. Копию берём из логов того участника, у
+#     кого она есть.
+# Порог: если за одно событие удалено столько сообщений — это почти наверняка
+# «очистить историю»/«удалить чат», а не удаление отдельных сообщений. Нужен как
+# запасной сигнал, когда у самого удалившего в логах мало/нет истории (например, он
+# подключил бота недавно), и сравнение по проценту от его логов не срабатывает.
+CLEAR_BATCH_THRESHOLD = 10
 
+
+def _allowed_notify(owner_id, target_id):
+    if not check_access(owner_id):
+        return False
+    if is_ignored(owner_id, target_id):
+        return False
+    if is_liza_blocked(owner_id):
+        return False
+    if is_user_blocked(owner_id, target_id):
+        return False
+    if is_fuck_blocked(owner_id, target_id):
+        return False
+    return True
+
+
+def _display_name(name, tag):
+    n = name or "Собеседник"
+    return f"{n} {tag}" if tag else n
+
+
+def _fetch_chat_history(owner_id, chat_id):
     conn = sqlite3.connect('spy_bot.db')
     c = conn.cursor()
-    c.execute("""SELECT from_user_name, from_user_tag, text, date FROM messages_v2 WHERE
-        owner_id = ? AND chat_id = ? ORDER BY date ASC""", (peer_id, actor_id))
-    all_msgs = c.fetchall()
+    c.execute("""SELECT from_user_name, from_user_tag, text, date FROM messages_v2
+                 WHERE owner_id = ? AND chat_id = ? ORDER BY date ASC""", (owner_id, chat_id))
+    rows = c.fetchall()
     conn.close()
+    return rows
 
-    if not all_msgs:
-        return
 
-    display_name = actor_name or "Собеседник"
-    if actor_tag:
-        display_name = f"{display_name} {actor_tag}"
-
+def _build_history_file(rows):
     buf = io.StringIO()
     buf.write(f"📁 История удалённого чата\n{'=' * 40}\n\n")
-    for from_name, from_tag, text, date in all_msgs:
+    for from_name, from_tag, text, date in rows:
         tag_str = f" {from_tag}" if from_tag else ""
-        buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[медиа]'}\n\n")
+        buf.write(f"[{(date or '')[:16]}] {from_name}{tag_str}:\n{text or '[медиа]'}\n\n")
     buf.seek(0)
-    file_obj = types.BufferedInputFile(buf.getvalue().encode("utf-8"), filename="deleted_chat.txt")
-    try:
-        await bot.send_document(
-            peer_id, file_obj,
-            caption=f"📁 Собеседник {display_name} удалил(а)/очистил(а) переписку. Вот её копия."
-        )
-    except Exception:
-        pass
+    return types.BufferedInputFile(buf.getvalue().encode("utf-8"), filename="deleted_chat.txt")
+
+
+async def _handle_chat_cleared(actor_id, peer_id, actor_name, actor_tag):
+    # actor_id очистил/удалил свой чат с peer_id.
+    # Уведомляем ОБОИХ участников, у кого подключён бот, отдавая копию переписки:
+    #   * собеседнику peer_id (он «шпионит» за actor) — его собственная копия,
+    #     а если её нет — сохранённая копия из логов actor (это и есть удалённое);
+    #   * самому actor_id — резервная копия его переписки (это его же бот).
+    actor_history = _fetch_chat_history(actor_id, peer_id)
+    peer_history = _fetch_chat_history(peer_id, actor_id)
+
+    peer_copy_rows = peer_history or actor_history
+    if peer_copy_rows and _allowed_notify(peer_id, actor_id):
+        try:
+            await bot.send_document(
+                peer_id, _build_history_file(peer_copy_rows),
+                caption=f"📁 Собеседник {_display_name(actor_name, actor_tag)} удалил(а)/очистил(а) переписку. Вот её копия."
+            )
+        except Exception:
+            logging.exception("Не удалось отправить копию удалённого чата собеседнику %s", peer_id)
+
+    if actor_history and check_access(actor_id):
+        try:
+            await bot.send_document(
+                actor_id, _build_history_file(actor_history),
+                caption="📁 Чат удалён/очищен. Вот резервная копия переписки."
+            )
+        except Exception:
+            logging.exception("Не удалось отправить резервную копию владельцу %s", actor_id)
 
 
 @dp.deleted_business_messages()
@@ -1800,7 +1837,7 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
         actor_name = conn_info.user.full_name
         actor_tag = f"(@{conn_info.user.username})" if conn_info.user.username else ""
     except Exception:
-        pass
+        logging.exception("get_business_connection не сработал для %s", event.business_connection_id)
 
     if actor_id is None:
         # Резерв: определяем владельца по одному из удалённых сообщений в логах.
@@ -1828,13 +1865,15 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
     deleted_set = set(deleted_ids)
     matching_count = len(db_set & deleted_set)
 
-    # Полная очистка/удаление чата: удалена вся (почти вся) известная история.
-    # Поправка на 90% — на случай пропущенных при логировании сообщений.
-    is_chat_cleared = len(db_set) > 0 and matching_count >= len(db_set) * 0.9
+    # Очистка/удаление чата: либо удалена почти вся известная история этого владельца,
+    # либо за один раз удалено много сообщений (запасной сигнал, если логов мало).
+    is_chat_cleared = (
+        (len(db_set) > 0 and matching_count >= len(db_set) * 0.8)
+        or len(deleted_set) >= CLEAR_BATCH_THRESHOLD
+    )
 
     if is_chat_cleared:
-        # actor_id очистил свой чат с peer_id -> уведомляем второго участника (peer_id).
-        await _notify_peer_chat_cleared(actor_id, peer_id, actor_name, actor_tag)
+        await _handle_chat_cleared(actor_id, peer_id, actor_name, actor_tag)
 
         # Логи очищенного чата у этого владельца больше не актуальны — удаляем их.
         try:
@@ -1844,7 +1883,7 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
             conn.commit()
             conn.close()
         except Exception:
-            pass
+            logging.exception("Не удалось очистить логи чата owner=%s chat=%s", actor_id, peer_id)
         return
 
     # Обычное удаление отдельных сообщений (например, собеседник удалил «для всех»)
