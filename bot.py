@@ -1724,151 +1724,186 @@ async def send_weekly_stats():
 
 
 # --- УДАЛЕНИЕ ЧАТА СОБЕСЕДНИКОМ ---
+#
+# Логика (важно: у чата два участника, и КАЖДЫЙ из них может подключить бота).
+# В логах чат между X и Y хранится «зеркально»:
+#   у владельца X: owner_id = X, chat_id = Y (Y — его собеседник)
+#   у владельца Y: owner_id = Y, chat_id = X (X — его собеседник)
+# Поэтому связывать записи двух владельцев нужно по паре {owner_id, chat_id},
+# а не по одному только chat_id (старый код сравнивал chat_id и никогда не находил
+# второго участника — из-за этого при очистке/удалении чата уведомление не приходило).
+#
+# Событие deleted_business_messages приходит в подключение того аккаунта, в котором
+# сообщения фактически удалились:
+#   * Собеседник удалил сообщение «для всех» -> событие приходит и в НАШЕ подключение
+#     (сообщение исчезло и у нас) -> уведомляем владельца этого подключения.
+#   * Собеседник очистил/удалил чат «у себя» -> событие приходит ТОЛЬКО в его
+#     подключение (у нас чат остаётся) -> уведомить нас можно, только если собеседник
+#     тоже подключил бота. Тогда, поймав полную очистку у одного участника, уведомляем
+#     ДРУГОГО участника (второго владельца) и отдаём ему его же копию переписки.
+async def _notify_peer_chat_cleared(actor_id, peer_id, actor_name, actor_tag):
+    # actor_id очистил свой чат с peer_id. Уведомляем собеседника peer_id, если он тоже
+    # подключил бота (его записи: owner_id = peer_id, chat_id = actor_id).
+    if not check_access(peer_id):
+        return
+    if is_ignored(peer_id, actor_id): return
+    if is_liza_blocked(peer_id): return
+    if is_user_blocked(peer_id, actor_id): return
+    if is_fuck_blocked(peer_id, actor_id): return
+
+    conn = sqlite3.connect('spy_bot.db')
+    c = conn.cursor()
+    c.execute("""SELECT from_user_name, from_user_tag, text, date FROM messages_v2 WHERE
+        owner_id = ? AND chat_id = ? ORDER BY date ASC""", (peer_id, actor_id))
+    all_msgs = c.fetchall()
+    conn.close()
+
+    if not all_msgs:
+        return
+
+    display_name = actor_name or "Собеседник"
+    if actor_tag:
+        display_name = f"{display_name} {actor_tag}"
+
+    buf = io.StringIO()
+    buf.write(f"📁 История удалённого чата\n{'=' * 40}\n\n")
+    for from_name, from_tag, text, date in all_msgs:
+        tag_str = f" {from_tag}" if from_tag else ""
+        buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[медиа]'}\n\n")
+    buf.seek(0)
+    file_obj = types.BufferedInputFile(buf.getvalue().encode("utf-8"), filename="deleted_chat.txt")
+    try:
+        await bot.send_document(
+            peer_id, file_obj,
+            caption=f"📁 Собеседник {display_name} удалил(а)/очистил(а) переписку. Вот её копия."
+        )
+    except Exception:
+        pass
+
+
 @dp.deleted_business_messages()
 async def handle_delete(event: types.BusinessMessagesDeleted):
     await asyncio.sleep(0.5)
     deleted_ids = event.message_ids
-    if not deleted_ids: return
+    if not deleted_ids:
+        return
 
-    conn = sqlite3.connect('spy_bot.db')
-    c = conn.cursor()
-    c.execute("SELECT owner_id, chat_id FROM messages_v2 WHERE id = ? AND chat_id = ?", (deleted_ids[0], event.chat.id))
-    row = c.fetchone()
+    peer_id = event.chat.id  # собеседник в подключении, где удалились сообщения
 
-    if not row:
+    # Определяем владельца подключения (аккаунт, в котором сообщения удалились).
+    actor_id = None
+    actor_name = None
+    actor_tag = None
+    try:
+        conn_info = await bot.get_business_connection(event.business_connection_id)
+        actor_id = conn_info.user.id
+        actor_name = conn_info.user.full_name
+        actor_tag = f"(@{conn_info.user.username})" if conn_info.user.username else ""
+    except Exception:
+        pass
+
+    if actor_id is None:
+        # Резерв: определяем владельца по одному из удалённых сообщений в логах.
+        conn = sqlite3.connect('spy_bot.db')
+        c = conn.cursor()
+        for mid in deleted_ids:
+            c.execute("SELECT owner_id FROM messages_v2 WHERE id = ? AND chat_id = ? LIMIT 1", (mid, peer_id))
+            r = c.fetchone()
+            if r:
+                actor_id = r[0]
+                break
         conn.close()
-        return
-    owner_id, chat_id = row
 
-    # Находим ВСЕХ владельцев этого чата (бот может быть подключен несколькими пользователями)
-    c.execute("SELECT DISTINCT owner_id FROM messages_v2 WHERE chat_id = ?", (chat_id,))
-    all_owners = [r[0] for r in c.fetchall()]
-    conn.close()
-
-    # Проверяем доступ для каждого владельца
-    valid_owners = [oid for oid in all_owners if check_access(oid)]
-    
-    if not valid_owners:
+    if actor_id is None:
         return
 
-    # Получаем все ID сообщений для этого чата (для всех владельцев)
+    # Все известные сообщения этого чата в логах именно того владельца, у которого удалили.
     conn = sqlite3.connect('spy_bot.db')
     c = conn.cursor()
-    c.execute("SELECT id FROM messages_v2 WHERE chat_id = ?", (chat_id,))
+    c.execute("SELECT id FROM messages_v2 WHERE owner_id = ? AND chat_id = ?", (actor_id, peer_id))
     db_ids = [r[0] for r in c.fetchall()]
     conn.close()
 
     db_set = set(db_ids)
     deleted_set = set(deleted_ids)
-    matching_count = len(db_set.intersection(deleted_set))
+    matching_count = len(db_set & deleted_set)
 
-    # Если удаляется вся известная история (с поправкой на 90% для надёжности при пропущенных логах)
-    is_chat_deleted = len(db_set) > 0 and matching_count >= len(db_set) * 0.9
+    # Полная очистка/удаление чата: удалена вся (почти вся) известная история.
+    # Поправка на 90% — на случай пропущенных при логировании сообщений.
+    is_chat_cleared = len(db_set) > 0 and matching_count >= len(db_set) * 0.9
 
-    if is_chat_deleted:
-        conn2 = sqlite3.connect('spy_bot.db')
-        c2 = conn2.cursor()
-        c2.execute("""SELECT from_user_name, from_user_tag, text, date FROM messages_v2 WHERE 
-            chat_id = ? ORDER BY date ASC""", (chat_id,))
-        all_msgs = c2.fetchall()
+    if is_chat_cleared:
+        # actor_id очистил свой чат с peer_id -> уведомляем второго участника (peer_id).
+        await _notify_peer_chat_cleared(actor_id, peer_id, actor_name, actor_tag)
 
-        if all_msgs:
-            buf = io.StringIO()
-            buf.write(f"📁 История удалённого чата\n{'=' * 40}\n\n")
-            for from_name, from_tag, text, date in all_msgs:
-                tag_str = f" {from_tag}" if from_tag else ""
-                buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[медиа]'}\n\n")
-            buf.seek(0)
-            file_obj = types.BufferedInputFile(buf.getvalue().encode("utf-8"), filename="deleted_chat.txt")
-            
-            # Отправляем копию истории КАЖДОМУ владельцу с доступом
-            for owner in valid_owners:
-                try:
-                    await bot.send_document(
-                        owner, file_obj, caption="📁 Собеседник удалил переписку. Вот её копия."
-                    )
-                    await asyncio.sleep(0.1)  # Небольшая пауза между отправками
-                except Exception:
-                    pass
-            
-            # Раз чат полностью удалён, подчищаем его логи из локальной БД для всех владельцев
-            c2.execute("DELETE FROM messages_v2 WHERE chat_id = ?", (chat_id,))
-            conn2.commit()
-            conn2.close()
-            return
-        conn2.close()
+        # Логи очищенного чата у этого владельца больше не актуальны — удаляем их.
+        try:
+            conn = sqlite3.connect('spy_bot.db')
+            c = conn.cursor()
+            c.execute("DELETE FROM messages_v2 WHERE owner_id = ? AND chat_id = ?", (actor_id, peer_id))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        return
 
-    # Если это было обычное удаление сообщений, а не всего чата
-    for msg_id in deleted_ids:
-        # Получаем информацию о сообщении
-        conn_temp = sqlite3.connect('spy_bot.db')
-        c_temp = conn_temp.cursor()
-        c_temp.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ?", (msg_id, event.chat.id))
-        msg_data = c_temp.fetchone()
-        conn_temp.close()
-        
-        if not msg_data:
-            continue
-            
-        msg_owner_id, from_user_id, from_name, from_tag, text, arch_id = msg_data
-        if not msg_owner_id or from_user_id == msg_owner_id:
-            continue
-        
-        # Находим всех владельцев этого чата
-        conn_owners = sqlite3.connect('spy_bot.db')
-        c_owners = conn_owners.cursor()
-        c_owners.execute("SELECT DISTINCT owner_id FROM messages_v2 WHERE chat_id = ?", (event.chat.id,))
-        all_owners = [r[0] for r in c_owners.fetchall()]
-        conn_owners.close()
-        
-        # Отправляем уведомление каждому владельцу с доступом
-        for owner_id2 in all_owners:
-            if not check_access(owner_id2):
+    # Обычное удаление отдельных сообщений (например, собеседник удалил «для всех»)
+    # -> уведомляем владельца этого подключения о пропавших сообщениях собеседника.
+    if check_access(actor_id):
+        for msg_id in deleted_ids:
+            conn = sqlite3.connect('spy_bot.db')
+            c = conn.cursor()
+            c.execute("SELECT from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ? AND owner_id = ?", (msg_id, peer_id, actor_id))
+            msg_data = c.fetchone()
+            conn.close()
+
+            if not msg_data:
                 continue
-            if is_ignored(owner_id2, from_user_id):
+
+            from_user_id, from_name, from_tag, text, arch_id = msg_data
+            # Не уведомляем владельца об удалении его собственных сообщений.
+            if from_user_id == actor_id:
                 continue
-            if is_liza_blocked(owner_id2):
-                continue
-            if is_user_blocked(owner_id2, from_user_id):
-                continue
-            if is_fuck_blocked(owner_id2, from_user_id):
-                continue
-            
+            if is_ignored(actor_id, from_user_id): continue
+            if is_liza_blocked(actor_id): continue
+            if is_user_blocked(actor_id, from_user_id): continue
+            if is_fuck_blocked(actor_id, from_user_id): continue
+
             try:
                 safe_name = html.escape(from_name or "Собеседник")
                 safe_tag = html.escape(from_tag or "")
                 user_info = f"👤 <b>{safe_name}</b> {safe_tag} удалил(а) сообщение:"
-                
+
                 if arch_id:
                     caption_text = user_info
                     if text and text != "[Медиа]":
                         caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
-                    
+
                     try:
                         if len(caption_text) > 1024:
                             raise ValueError("too long")
-                        await bot.copy_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id, caption=caption_text, parse_mode="HTML")
+                        await bot.copy_message(chat_id=actor_id, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id, caption=caption_text, parse_mode="HTML")
                     except Exception:
                         try:
-                            copied = await bot.forward_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id)
-                            await bot.send_message(owner_id2, caption_text, reply_to_message_id=copied.message_id, parse_mode="HTML")
+                            copied = await bot.forward_message(chat_id=actor_id, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id)
+                            await bot.send_message(actor_id, caption_text, reply_to_message_id=copied.message_id, parse_mode="HTML")
                         except Exception:
-                            await bot.send_message(owner_id2, f"{caption_text}\n<i>[Медиа скрыто или недоступно]</i>", parse_mode="HTML")
+                            await bot.send_message(actor_id, f"{caption_text}\n<i>[Медиа скрыто или недоступно]</i>", parse_mode="HTML")
                 elif text:
                     if text.strip().startswith('.'):
                         continue
-                    await bot.send_message(owner_id2, f"{user_info}\n\n<blockquote>{html.escape(text)}</blockquote>", parse_mode="HTML")
+                    await bot.send_message(actor_id, f"{user_info}\n\n<blockquote>{html.escape(text)}</blockquote>", parse_mode="HTML")
             except Exception:
                 pass
 
-    # Удаляем поштучно удалённые сообщения из БД
+    # Удаляем поштучно удалённые сообщения из логов этого владельца.
     try:
-        conn3 = sqlite3.connect('spy_bot.db')
-        c3 = conn3.cursor()
+        conn = sqlite3.connect('spy_bot.db')
+        c = conn.cursor()
         placeholders = ','.join('?' for _ in deleted_ids)
-        c3.execute(f"DELETE FROM messages_v2 WHERE chat_id = ? AND id IN ({placeholders})", (event.chat.id, *deleted_ids))
-        conn3.commit()
-        conn3.close()
+        c.execute(f"DELETE FROM messages_v2 WHERE owner_id = ? AND chat_id = ? AND id IN ({placeholders})", (actor_id, peer_id, *deleted_ids))
+        conn.commit()
+        conn.close()
     except Exception:
         pass
 
