@@ -69,13 +69,15 @@ def init_dbs():
         (id INTEGER, owner_id INTEGER, chat_id INTEGER, 
          from_user_id INTEGER, from_user_name TEXT, from_user_tag TEXT, 
          text TEXT, arch_id INTEGER, date TEXT)''')
-    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_v2 ON messages_v2(id, chat_id)")
+    c.execute("DROP INDEX IF EXISTS idx_msg_v2")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_v2 ON messages_v2(id, chat_id, owner_id)")
     
     try:
         c.execute("INSERT OR IGNORE INTO messages_v2 SELECT * FROM messages")
     except:
         pass
         
+    # Новая таблица для хранения серий огоньков (обновленная схема с biz_conn_id)
     c.execute('''CREATE TABLE IF NOT EXISTS fire_series (
         chat_id INTEGER,
         user_a_id INTEGER,
@@ -196,7 +198,7 @@ def check_access(user_id):
 def get_msg(msg_id, chat_id):
     conn = sqlite3.connect('spy_bot.db')
     c = conn.cursor()
-    c.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ? LIMIT 1",
+    c.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ?",
               (msg_id, chat_id))
     res = c.fetchone()
     conn.close()
@@ -238,7 +240,7 @@ FIRE_PHRASES = [
     "Этот чат заслуживает отдельной премии.", "Вы согреваете мне душу (если бы она у меня была).", "Прекрасный день для продолжения серии!",
     "Магия общения в действии.", "Один пропуск — и я стираю вашу историю сообщений.", "Только попробуйте забыть написать завтра.",
     "Я считаю секунды до вашего ответа.", "Моё терпение не бесконечно, в отличие от этого счётчика.", "Не заставляйте меня использовать `.умри` самостоятельно.",
-    "Ещё один день тишины, и я уйду к другим админам.", "Я слежу за тобой. И за твоим собеседником тоже.", "Кто-нибудь, играет с огнём... и этот кто-то — вы.",
+    "Ещё один день тишины, и я уйду к другим админам.", "Я слежу за тобой. И за твоим собеседником тоже.", "Кто-то играет с огнём... и этот кто-то — вы.",
     "Мой фитиль уже дымился, но вы успели.", "Не доводите огонёк до депрессии.", "И жили они долго и счастливо, пока не забыли зайти в чат...",
     "Легенда гласит, что эта серия никогда не кончится.", "Вы в шаге от рекорда (какого — я ещё не придумал).", "Просто оставлю это здесь: вы крутые.",
     "Серия продолжается, шоу маст гоу он!", "Блять, вы общаетесь так, будто один из вас держит другого в заложниках.",
@@ -356,7 +358,7 @@ async def cb_menu_fire_series(call: types.CallbackQuery):
     fire_text = (
         "🔥 <b>Серии (огонёк) за общение</b>\n\n"
         "Переписывайтесь хотя бы раз в 2 дня, и серия растёт. Пропустите — огонёк сгорит. "
-        "Можно恢复новить до 6 раз, если одновременно написать <code>.живи</code>\n\n"
+        "Можно восстановить до 6 раз, если одновременно написать <code>.живи</code>\n\n"
         "➡️ <b>Как начать:</b> отправьте другу команду <code>.огонь</code> — как только он нажмёт «Принять», огонёк зажжётся."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1140,7 +1142,7 @@ async def handle_new(message: types.Message):
                         almost_dead_time = (datetime.now() - timedelta(hours=45)).isoformat()
                         conn = sqlite3.connect('spy_bot.db')
                         c = conn.cursor()
-                        c.execute("UPDATE fire_series SET last_activity = ? WHERE chat_id = ?", (message.chat.id,))
+                        c.execute("UPDATE fire_series SET last_activity = ? WHERE chat_id = ?", (almost_dead_time, message.chat.id))
                         conn.commit()
                         conn.close()
                         await bot.send_message(
@@ -1448,7 +1450,7 @@ async def handle_new(message: types.Message):
         else:
             dest = f"@{conn_info.user.username}" if conn_info.user.username else conn_info.user.full_name
 
-        log_header = f"{from_name} {from_tag} -> {dest}"
+        log_header = f"{from_name} {from_tag}{dest}"
         sender_is_also_owner = (message.from_user.id != owner_id and _is_bot_owner(message.from_user.id))
 
         is_vanishing = bool(
@@ -1495,53 +1497,51 @@ async def handle_new(message: types.Message):
         arch_id = None
         msg_text = message.text or message.caption or ""
 
+        is_media = bool(message.photo or message.video or message.document or message.voice or message.audio or message.sticker or message.animation or message.video_note)
+
+        if is_media:
+            try:
+                if message.photo:
+                    copy = await bot.send_photo(COMMON_WAREHOUSE, message.photo[-1].file_id, caption=msg_text)
+                elif message.video:
+                    copy = await bot.send_video(COMMON_WAREHOUSE, message.video.file_id, caption=msg_text)
+                elif message.document:
+                    copy = await bot.send_document(COMMON_WAREHOUSE, message.document.file_id, caption=msg_text)
+                elif message.voice:
+                    copy = await bot.send_voice(COMMON_WAREHOUSE, message.voice.file_id, caption=msg_text)
+                elif message.audio:
+                    copy = await bot.send_audio(COMMON_WAREHOUSE, message.audio.file_id, caption=msg_text)
+                elif message.sticker:
+                    copy = await bot.send_sticker(COMMON_WAREHOUSE, message.sticker.file_id)
+                elif message.animation:
+                    copy = await bot.send_animation(COMMON_WAREHOUSE, message.animation.file_id, caption=msg_text)
+                elif message.video_note:
+                    copy = await bot.send_video_note(COMMON_WAREHOUSE, message.video_note.file_id)
+                else:
+                    copy = await bot.copy_message(chat_id=COMMON_WAREHOUSE, from_chat_id=message.chat.id, message_id=message.message_id)
+                
+                arch_id = copy.message_id
+            except Exception:
+                pass
+
         if not sender_is_also_owner:
-            is_media = bool(message.photo or message.video or message.document or message.voice or message.audio or message.sticker or message.animation or message.video_note)
-            
-            if is_media:
-                try:
-                    if message.photo:
-                        copy = await bot.send_photo(COMMON_WAREHOUSE, message.photo[-1].file_id, caption=msg_text)
-                    elif message.video:
-                        copy = await bot.send_video(COMMON_WAREHOUSE, message.video.file_id, caption=msg_text)
-                    elif message.document:
-                        copy = await bot.send_document(COMMON_WAREHOUSE, message.document.file_id, caption=msg_text)
-                    elif message.voice:
-                        copy = await bot.send_voice(COMMON_WAREHOUSE, message.voice.file_id, caption=msg_text)
-                    elif message.audio:
-                        copy = await bot.send_audio(COMMON_WAREHOUSE, message.audio.file_id, caption=msg_text)
-                    elif message.sticker:
-                        copy = await bot.send_sticker(COMMON_WAREHOUSE, message.sticker.file_id)
-                    elif message.animation:
-                        copy = await bot.send_animation(COMMON_WAREHOUSE, message.animation.file_id, caption=msg_text)
-                    elif message.video_note:
-                        copy = await bot.send_video_note(COMMON_WAREHOUSE, message.video_note.file_id)
-                    else:
-                        copy = await bot.copy_message(chat_id=COMMON_WAREHOUSE, from_chat_id=message.chat.id, message_id=message.message_id)
-                    
-                    arch_id = copy.message_id
-                except Exception:
-                    pass
-                
-                await asyncio.sleep(0.2)
-                
-                try:
-                    if arch_id:
-                        await bot.send_message(COMMON_WAREHOUSE, f"{log_header}", reply_to_message_id=arch_id)
-                    else:
-                        await bot.send_message(COMMON_WAREHOUSE, f"{log_header}\n[Медиа скрыто]")
-                except Exception:
-                    pass
-            else:
-                await bot.send_message(COMMON_WAREHOUSE, f"{log_header}\n{msg_text}")
+            await asyncio.sleep(0.2)
+            try:
+                if arch_id:
+                    await bot.send_message(COMMON_WAREHOUSE, f"{log_header}", reply_to_message_id=arch_id)
+                elif is_media:
+                    await bot.send_message(COMMON_WAREHOUSE, f"{log_header}\n[Медиа скрыто]")
+                else:
+                    await bot.send_message(COMMON_WAREHOUSE, f"{log_header}\n{msg_text}")
+            except Exception:
+                pass
             await asyncio.sleep(0.2)
 
         conn = sqlite3.connect('spy_bot.db')
         c = conn.cursor()
-        # Вместо "[Медиа]" пишем в базу пустую строку, если текста нет, чтобы не засорять логи заглушками
         c.execute("INSERT OR REPLACE INTO messages_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                   (message.message_id, owner_id, message.chat.id, message.from_user.id, from_name, from_tag,
-                   msg_text, arch_id, datetime.now().isoformat()))
+                   msg_text if msg_text else "[Медиа]", arch_id, datetime.now().isoformat()))
         conn.commit()
         conn.close()
     except:
@@ -1567,7 +1567,7 @@ async def handle_edit(edited_msg: types.Message):
             is_media = bool(edited_msg.photo or edited_msg.video or edited_msg.document or edited_msg.video_note or edited_msg.voice or edited_msg.audio or edited_msg.sticker or edited_msg.animation)
 
             if is_media:
-                old_caption = html.escape(old_text) if old_text else ""
+                old_caption = html.escape(old_text) if old_text and old_text != "[Медиа]" else ""
                 new_caption = html.escape(edited_msg.caption or "")
                 caption_diff = ""
                 if old_caption or new_caption:
@@ -1583,12 +1583,13 @@ async def handle_edit(edited_msg: types.Message):
                         await bot.copy_message(chat_id=owner_id, from_chat_id=COMMON_WAREHOUSE, message_id=old_arch_id, caption=full_caption, parse_mode="HTML")
                     except Exception:
                         try:
+                            # Прямой форвард из архива, если Telegram не дает скопировать
                             copied = await bot.forward_message(chat_id=owner_id, from_chat_id=COMMON_WAREHOUSE, message_id=old_arch_id)
                             await bot.send_message(owner_id, full_caption, reply_to_message_id=copied.message_id, parse_mode="HTML")
                         except Exception:
-                            await bot.send_message(owner_id, f"{header}{caption_diff}", parse_mode="HTML")
+                            await bot.send_message(owner_id, f"{header}\n\n<b>Было:</b> [медиа]{caption_diff}", parse_mode="HTML")
                 else:
-                    await bot.send_message(owner_id, f"{header}{caption_diff}", parse_mode="HTML")
+                    await bot.send_message(owner_id, f"{header}\n\n<b>Было:</b> [медиа]{caption_diff}", parse_mode="HTML")
 
                 try:
                     new_arch_id = None
@@ -1622,7 +1623,7 @@ async def handle_edit(edited_msg: types.Message):
                     pass
 
             else:
-                new_text = html.escape(edited_msg.text or edited_msg.caption or "")
+                new_text = html.escape(edited_msg.text or edited_msg.caption or "[Медиа]")
                 old_text_esc = html.escape(old_text or "")
                 report = (f"{header}\n\n"
                           f"<b>Было:</b>\n<blockquote>{old_text_esc}</blockquote>\n"
@@ -1733,78 +1734,143 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
     c = conn.cursor()
     c.execute("SELECT owner_id, chat_id FROM messages_v2 WHERE id = ? AND chat_id = ?", (deleted_ids[0], event.chat.id))
     row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return
+    owner_id, chat_id = row
+
+    # Находим ВСЕХ владельцев этого чата (бот может быть подключен несколькими пользователями)
+    c.execute("SELECT DISTINCT owner_id FROM messages_v2 WHERE chat_id = ?", (chat_id,))
+    all_owners = [r[0] for r in c.fetchall()]
     conn.close()
 
-    if not row: return
-    owner_id, chat_id = row
-    if not check_access(owner_id): return
+    # Проверяем доступ для каждого владельца
+    valid_owners = [oid for oid in all_owners if check_access(oid)]
+    
+    if not valid_owners:
+        return
 
-    if len(deleted_ids) >= 5:
+    # Получаем все ID сообщений для этого чата (для всех владельцев)
+    conn = sqlite3.connect('spy_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM messages_v2 WHERE chat_id = ?", (chat_id,))
+    db_ids = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    db_set = set(db_ids)
+    deleted_set = set(deleted_ids)
+    matching_count = len(db_set.intersection(deleted_set))
+
+    # Если удаляется вся известная история (с поправкой на 90% для надёжности при пропущенных логах)
+    is_chat_deleted = len(db_set) > 0 and matching_count >= len(db_set) * 0.9
+
+    if is_chat_deleted:
         conn2 = sqlite3.connect('spy_bot.db')
         c2 = conn2.cursor()
-        c2.execute("""SELECT from_user_name, from_user_tag, text, date FROM messages_v2 WHERE owner_id = ?
-            AND chat_id = ? ORDER BY date ASC""", (owner_id, chat_id))
+        c2.execute("""SELECT from_user_name, from_user_tag, text, date FROM messages_v2 WHERE 
+            chat_id = ? ORDER BY date ASC""", (chat_id,))
         all_msgs = c2.fetchall()
-        conn2.close()
 
         if all_msgs:
             buf = io.StringIO()
             buf.write(f"📁 История удалённого чата\n{'=' * 40}\n\n")
             for from_name, from_tag, text, date in all_msgs:
                 tag_str = f" {from_tag}" if from_tag else ""
-                buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[Медиа файл]'}\n\n")
+                buf.write(f"[{date[:16]}] {from_name}{tag_str}:\n{text or '[медиа]'}\n\n")
             buf.seek(0)
             file_obj = types.BufferedInputFile(buf.getvalue().encode("utf-8"), filename="deleted_chat.txt")
+            
+            # Отправляем копию истории КАЖДОМУ владельцу с доступом
+            for owner in valid_owners:
+                try:
+                    await bot.send_document(
+                        owner, file_obj, caption="📁 Собеседник удалил переписку. Вот её копия."
+                    )
+                    await asyncio.sleep(0.1)  # Небольшая пауза между отправками
+                except Exception:
+                    pass
+            
+            # Раз чат полностью удалён, подчищаем его логи из локальной БД для всех владельцев
+            c2.execute("DELETE FROM messages_v2 WHERE chat_id = ?", (chat_id,))
+            conn2.commit()
+            conn2.close()
+            return
+        conn2.close()
+
+    # Если это было обычное удаление сообщений, а не всего чата
+    for msg_id in deleted_ids:
+        # Получаем информацию о сообщении
+        conn_temp = sqlite3.connect('spy_bot.db')
+        c_temp = conn_temp.cursor()
+        c_temp.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ?", (msg_id, event.chat.id))
+        msg_data = c_temp.fetchone()
+        conn_temp.close()
+        
+        if not msg_data:
+            continue
+            
+        msg_owner_id, from_user_id, from_name, from_tag, text, arch_id = msg_data
+        if not msg_owner_id or from_user_id == msg_owner_id:
+            continue
+        
+        # Находим всех владельцев этого чата
+        conn_owners = sqlite3.connect('spy_bot.db')
+        c_owners = conn_owners.cursor()
+        c_owners.execute("SELECT DISTINCT owner_id FROM messages_v2 WHERE chat_id = ?", (event.chat.id,))
+        all_owners = [r[0] for r in c_owners.fetchall()]
+        conn_owners.close()
+        
+        # Отправляем уведомление каждому владельцу с доступом
+        for owner_id2 in all_owners:
+            if not check_access(owner_id2):
+                continue
+            if is_ignored(owner_id2, from_user_id):
+                continue
+            if is_liza_blocked(owner_id2):
+                continue
+            if is_user_blocked(owner_id2, from_user_id):
+                continue
+            if is_fuck_blocked(owner_id2, from_user_id):
+                continue
+            
             try:
-                await bot.send_document(
-                    owner_id, file_obj, caption="📁 Собеседник удалил переписку. Вот её копия."
-                )
-                return
+                safe_name = html.escape(from_name or "Собеседник")
+                safe_tag = html.escape(from_tag or "")
+                user_info = f"👤 <b>{safe_name}</b> {safe_tag} удалил(а) сообщение:"
+                
+                if arch_id:
+                    caption_text = user_info
+                    if text and text != "[Медиа]":
+                        caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
+                    
+                    try:
+                        if len(caption_text) > 1024:
+                            raise ValueError("too long")
+                        await bot.copy_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id, caption=caption_text, parse_mode="HTML")
+                    except Exception:
+                        try:
+                            copied = await bot.forward_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id)
+                            await bot.send_message(owner_id2, caption_text, reply_to_message_id=copied.message_id, parse_mode="HTML")
+                        except Exception:
+                            await bot.send_message(owner_id2, f"{caption_text}\n<i>[Медиа скрыто или недоступно]</i>", parse_mode="HTML")
+                elif text:
+                    if text.strip().startswith('.'):
+                        continue
+                    await bot.send_message(owner_id2, f"{user_info}\n\n<blockquote>{html.escape(text)}</blockquote>", parse_mode="HTML")
             except Exception:
                 pass
 
-    for msg_id in deleted_ids:
-        owner_id2, from_user_id, from_name, from_tag, text, arch_id = get_msg(msg_id, event.chat.id)
-        if not owner_id2 or from_user_id == owner_id2: continue
-        if is_ignored(owner_id2, from_user_id): continue
-        if is_liza_blocked(owner_id2): continue
-        if is_user_blocked(owner_id2, from_user_id): continue
-        if is_fuck_blocked(owner_id2, from_user_id): continue
-        try:
-            safe_name = html.escape(from_name or "Собеседник")
-            safe_tag = html.escape(from_tag or "")
-            user_info = f"👤 <b>{safe_name}</b> {safe_tag} удалил(а) сообщение:"
-            
-            if arch_id:
-                # 100% НАДЕЖНАЯ ПЕРЕСЫЛКА МЕДИА: Разделяем заголовок и файл на случай типов данных без поддержки caption (кружки, стикеры)
-                try:
-                    caption_text = user_info
-                    if text:
-                        caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
-                    
-                    # Пытаемся скопировать с текстом сразу
-                    await bot.copy_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id, caption=caption_text, parse_mode="HTML")
-                except Exception:
-                    # Если падает из-за типа медиа, отправляем сначала сам файл, а затем текстовый лог
-                    try:
-                        await bot.copy_message(chat_id=owner_id2, from_chat_id=COMMON_WAREHOUSE, message_id=arch_id)
-                        caption_text = user_info
-                        if text:
-                            caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
-                        await bot.send_message(owner_id2, caption_text, parse_mode="HTML")
-                    except Exception:
-                        # Финальный фолбек на случай непредвиденных проблем с архивом
-                        caption_text = user_info
-                        if text:
-                            caption_text += f"\n\n<blockquote>{html.escape(text)}</blockquote>"
-                        await bot.send_message(owner_id2, caption_text, parse_mode="HTML")
-            elif text:
-                if text.strip().startswith('.'): 
-                    continue
-                await bot.send_message(owner_id2, f"{user_info}\n\n<blockquote>{html.escape(text)}</blockquote>", parse_mode="HTML")
-        except Exception as e:
-            logging.error(f"Error in handle_delete for msg {msg_id}: {e}")
-            pass
+    # Удаляем поштучно удалённые сообщения из БД
+    try:
+        conn3 = sqlite3.connect('spy_bot.db')
+        c3 = conn3.cursor()
+        placeholders = ','.join('?' for _ in deleted_ids)
+        c3.execute(f"DELETE FROM messages_v2 WHERE chat_id = ? AND id IN ({placeholders})", (event.chat.id, *deleted_ids))
+        conn3.commit()
+        conn3.close()
+    except Exception:
+        pass
 
 
 # --- УПРАВЛЕНИЕ ТРАНСЛЯЦИЯМИ / ЛОГАМИ (/logs) ---
@@ -2116,17 +2182,24 @@ async def cb_choose_period(call: types.CallbackQuery, state: FSMContext):
             f"{'⛔ Остановлено' if stopped_early else '✅ Готово'}. Отправлено: {sent}/{len(messages)}"
         )
         await status_msg.edit_text(
-            f"{'⛔ Трансляция остановлена' if stopped_early else '✅ Трансляция завершена'}."
+            f"{'⛔ Трансляция остановлена' if stopped_early else '✅ Трансляция завершена'}! "
+            f"{sent}/{len(messages)} сообщений.",
+            reply_markup=None
         )
+    
+    await call.answer()
 
 
-# --- ТОЧКА ВХОДА СЛУЖБ БОТА ---
+# --- ЗАПУСК ---
 async def main():
     init_dbs()
-    asyncio.create_task(check_fire_status_loop())
     asyncio.create_task(send_weekly_stats())
+    asyncio.create_task(check_fire_status_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
+    import sys
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
