@@ -1794,7 +1794,7 @@ def _build_history_file(rows):
 # Telegram может прислать несколькими пачками (deleted_business_messages по 100 id),
 # и каждая пачка приводила бы к новой копии. Ключ — направленная пара (кому, о ком).
 _recent_clear_notifs = {}
-CLEAR_NOTIF_DEDUP_SECONDS = 60
+CLEAR_NOTIF_DEDUP_SECONDS = 15
 
 
 def _already_notified_clear(recipient_id, other_id):
@@ -1810,31 +1810,60 @@ def _already_notified_clear(recipient_id, other_id):
     return False
 
 
-async def _handle_chat_cleared(actor_id, peer_id, actor_name, actor_tag):
-    # actor_id очистил/удалил свой чат с peer_id -> уведомляем ВТОРОГО участника peer_id
-    # (ровно одна копия каждому: см. комментарий выше). actor не уведомляем.
-    if not _allowed_notify(peer_id, actor_id):
+def _name_from_logs(owner_id, chat_id, target_user_id):
+    # Имя пользователя target_user_id так, как оно записано в логах owner_id.
+    conn = sqlite3.connect('spy_bot.db')
+    c = conn.cursor()
+    c.execute("""SELECT from_user_name, from_user_tag FROM messages_v2
+                 WHERE owner_id = ? AND chat_id = ? AND from_user_id = ?
+                 ORDER BY date DESC LIMIT 1""", (owner_id, chat_id, target_user_id))
+    r = c.fetchone()
+    conn.close()
+    return (r[0], r[1]) if r else (None, None)
+
+
+async def _send_clear_copy(recipient_id, other_id, other_name, other_tag):
+    # Отправляем recipient_id ровно одну копию переписки с other_id.
+    if not _allowed_notify(recipient_id, other_id):
+        logging.info("Очистка чата: получатель %s недоступен (доступ/блок), копия не отправлена", recipient_id)
         return
-    if _already_notified_clear(peer_id, actor_id):
+    if _already_notified_clear(recipient_id, other_id):
+        logging.info("Очистка чата: копия для %s о %s уже отправлена недавно — пропуск (дедуп)", recipient_id, other_id)
         return
 
-    # Предпочитаем копию из логов самого peer; если их нет — сохранённые логи actor.
-    rows = _fetch_chat_history(peer_id, actor_id) or _fetch_chat_history(actor_id, peer_id)
+    # Предпочитаем копию из логов самого получателя; если их нет — из логов второй стороны.
+    rows = _fetch_chat_history(recipient_id, other_id) or _fetch_chat_history(other_id, recipient_id)
     if not rows:
+        logging.info("Очистка чата: нет сохранённой истории для копии recipient=%s other=%s", recipient_id, other_id)
         return
     try:
         await bot.send_document(
-            peer_id, _build_history_file(rows),
-            caption=f"📁 Собеседник {_display_name(actor_name, actor_tag)} удалил(а)/очистил(а) переписку. Вот её копия."
+            recipient_id, _build_history_file(rows),
+            caption=f"📁 Чат с {_display_name(other_name, other_tag)} был удалён/очищен. Вот копия переписки."
         )
+        logging.info("Очистка чата: копия отправлена recipient=%s other=%s строк=%s", recipient_id, other_id, len(rows))
     except Exception:
-        logging.exception("Не удалось отправить копию удалённого чата собеседнику %s", peer_id)
+        logging.exception("Не удалось отправить копию удалённого чата получателю %s", recipient_id)
+
+
+async def _handle_chat_cleared(actor_id, peer_id, actor_name, actor_tag):
+    # Чат между actor_id и peer_id очищен. Уведомляем ОБОИХ участников, у кого подключён
+    # бот, по ОДНОЙ копии каждому (дедуп по направленной паре не даёт продублировать,
+    # если событие пришло с обоих подключений или несколькими пачками):
+    #   * peer_id — получает копию (его «шпионская» сторона: собеседник actor очистил чат);
+    #   * actor_id — получает копию своей переписки (в т.ч. когда владелец сам очистил
+    #     чат у себя на тесте — иначе ему бы ничего не пришло).
+    peer_name, peer_tag = _name_from_logs(actor_id, peer_id, peer_id)
+    await _send_clear_copy(peer_id, actor_id, actor_name, actor_tag)
+    await _send_clear_copy(actor_id, peer_id, peer_name, peer_tag)
 
 
 @dp.deleted_business_messages()
 async def handle_delete(event: types.BusinessMessagesDeleted):
     await asyncio.sleep(0.5)
     deleted_ids = event.message_ids
+    logging.info("handle_delete: событие удаления, chat=%s, сообщений=%s, conn=%s",
+                 getattr(event.chat, "id", None), len(deleted_ids or []), event.business_connection_id)
     if not deleted_ids:
         return
 
@@ -1892,6 +1921,11 @@ async def handle_delete(event: types.BusinessMessagesDeleted):
         (actor_count >= 3 and matching_count >= actor_count * 0.8)
         or (ref_count >= 2 and len(deleted_set) >= ref_count * 0.8)
         or len(deleted_set) >= CLEAR_BATCH_THRESHOLD
+    )
+
+    logging.info(
+        "handle_delete: actor=%s peer=%s удалено=%s логов_actor=%s логов_peer=%s совпало=%s -> очистка=%s",
+        actor_id, peer_id, len(deleted_set), actor_count, peer_count, matching_count, is_chat_cleared,
     )
 
     if is_chat_cleared:
