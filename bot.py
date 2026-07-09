@@ -1831,21 +1831,30 @@ async def _send_clear_copy(recipient_id, other_id, other_name, other_tag):
 
 async def _notify_deleted_message(actor_id, peer_id, msg_id):
     # Уведомляем actor об удалённом собеседником одном сообщении.
-    row = _db("""SELECT from_user_id, from_user_name, from_user_tag, text, arch_id
+    row = _db("""SELECT from_user_id, from_user_name, from_user_tag, text, arch_id, media_type
                  FROM messages_v2 WHERE id = ? AND chat_id = ? AND owner_id = ?""",
               (msg_id, peer_id, actor_id), fetch="one")
     if not row:
         return
-    from_user_id, from_name, from_tag, text, arch_id = row
+    from_user_id, from_name, from_tag, text, arch_id, media_type = row
     if from_user_id == actor_id or not _allowed_notify(actor_id, from_user_id):
         return
     if text and text.strip().startswith('.'):
         return
     header = f"👤 <b>{html.escape(from_name or 'Собеседник')}</b> {html.escape(from_tag or '')} удалил(а) сообщение:"
     quote = f"\n\n<blockquote>{html.escape(text)}</blockquote>" if text and text != "[Медиа]" else ""
+    caption = header + quote
+    # У стикеров и видео-кружков нельзя прикрепить подпись, поэтому уведомление
+    # отправляем отдельным сообщением следом за самим медиа.
+    no_caption_media = media_type in ("sticker", "video_note")
     try:
-        if arch_id:
-            caption = header + quote
+        if arch_id and no_caption_media:
+            try:
+                await bot.copy_message(actor_id, COMMON_WAREHOUSE, arch_id)
+            except Exception:
+                await bot.forward_message(actor_id, COMMON_WAREHOUSE, arch_id)
+            await bot.send_message(actor_id, caption, parse_mode="HTML")
+        elif arch_id:
             try:
                 if len(caption) > 1024:
                     raise ValueError("too long")
