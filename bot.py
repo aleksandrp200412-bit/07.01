@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.markdown import hbold, hlink
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, InputMediaPhoto, InputMediaVideo
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -69,6 +69,11 @@ def init_dbs():
         (id INTEGER, owner_id INTEGER, chat_id INTEGER, 
          from_user_id INTEGER, from_user_name TEXT, from_user_tag TEXT, 
          text TEXT, arch_id INTEGER, date TEXT)''')
+    for _col, _type in (("file_uid", "TEXT"), ("file_id", "TEXT"), ("media_type", "TEXT")):
+        try:
+            c.execute(f"ALTER TABLE messages_v2 ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
     c.execute("DROP INDEX IF EXISTS idx_msg_v2")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_v2 ON messages_v2(id, chat_id, owner_id)")
     
@@ -198,11 +203,31 @@ def check_access(user_id):
 def get_msg(msg_id, chat_id):
     conn = sqlite3.connect('spy_bot.db')
     c = conn.cursor()
-    c.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id FROM messages_v2 WHERE id = ? AND chat_id = ?",
+    c.execute("SELECT owner_id, from_user_id, from_user_name, from_user_tag, text, arch_id, file_uid, file_id, media_type FROM messages_v2 WHERE id = ? AND chat_id = ?",
               (msg_id, chat_id))
     res = c.fetchone()
     conn.close()
-    return res if res else (None, None, None, None, None, None)
+    return res if res else (None, None, None, None, None, None, None, None, None)
+
+
+def extract_media(msg):
+    if msg.photo:
+        return msg.photo[-1].file_id, msg.photo[-1].file_unique_id, "photo"
+    if msg.video:
+        return msg.video.file_id, msg.video.file_unique_id, "video"
+    if msg.document:
+        return msg.document.file_id, msg.document.file_unique_id, "document"
+    if msg.voice:
+        return msg.voice.file_id, msg.voice.file_unique_id, "voice"
+    if msg.audio:
+        return msg.audio.file_id, msg.audio.file_unique_id, "audio"
+    if msg.sticker:
+        return msg.sticker.file_id, msg.sticker.file_unique_id, "sticker"
+    if msg.animation:
+        return msg.animation.file_id, msg.animation.file_unique_id, "animation"
+    if msg.video_note:
+        return msg.video_note.file_id, msg.video_note.file_unique_id, "video_note"
+    return None, None, None
 
 
 # --- СПИСОК ФРАЗ ОГОНЬКА ---
@@ -1537,11 +1562,16 @@ async def handle_new(message: types.Message):
                 pass
             await asyncio.sleep(0.2)
 
+        m_fid, m_uid, m_type = extract_media(message)
         conn = sqlite3.connect('spy_bot.db')
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO messages_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        c.execute("""INSERT OR REPLACE INTO messages_v2
+                     (id, owner_id, chat_id, from_user_id, from_user_name, from_user_tag,
+                      text, arch_id, date, file_uid, file_id, media_type)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                   (message.message_id, owner_id, message.chat.id, message.from_user.id, from_name, from_tag,
-                   msg_text if msg_text else "[Медиа]", arch_id, datetime.now().isoformat()))
+                   msg_text if msg_text else "[Медиа]", arch_id, datetime.now().isoformat(),
+                   m_uid, m_fid, m_type))
         conn.commit()
         conn.close()
     except:
@@ -1553,7 +1583,7 @@ async def handle_edit(edited_msg: types.Message):
     if edited_msg.text and edited_msg.text.strip().startswith('.'):
         return
 
-    owner_id, from_user_id, from_name, from_tag, old_text, old_arch_id = get_msg(edited_msg.message_id, edited_msg.chat.id)
+    owner_id, from_user_id, from_name, from_tag, old_text, old_arch_id, old_uid, old_fid, old_type = get_msg(edited_msg.message_id, edited_msg.chat.id)
     if owner_id and from_user_id != owner_id and check_access(owner_id):
         if is_ignored(owner_id, from_user_id): return
         if is_liza_blocked(owner_id): return
@@ -1567,6 +1597,7 @@ async def handle_edit(edited_msg: types.Message):
             is_media = bool(edited_msg.photo or edited_msg.video or edited_msg.document or edited_msg.video_note or edited_msg.voice or edited_msg.audio or edited_msg.sticker or edited_msg.animation)
 
             if is_media:
+                new_fid, new_uid, new_type = extract_media(edited_msg)
                 old_caption = html.escape(old_text) if old_text and old_text != "[Медиа]" else ""
                 new_caption = html.escape(edited_msg.caption or "")
                 caption_diff = ""
@@ -1576,7 +1607,29 @@ async def handle_edit(edited_msg: types.Message):
 
                 full_caption = f"{header}{caption_diff}"
 
-                if old_arch_id:
+                media_replaced = bool(old_uid and new_uid and old_uid != new_uid)
+                sent_as_album = False
+
+                if media_replaced and old_fid and new_fid and old_type in ("photo", "video") and new_type in ("photo", "video"):
+                    def _input_media(fid, mtype, cap=None):
+                        if mtype == "video":
+                            return InputMediaVideo(media=fid, caption=cap, parse_mode="HTML")
+                        return InputMediaPhoto(media=fid, caption=cap, parse_mode="HTML")
+                    try:
+                        head_cap = full_caption if len(full_caption) <= 1024 else header
+                        await bot.send_media_group(owner_id, [
+                            _input_media(old_fid, old_type, head_cap),
+                            _input_media(new_fid, new_type),
+                        ])
+                        if head_cap != full_caption:
+                            await bot.send_message(owner_id, full_caption[:4096], parse_mode="HTML")
+                        sent_as_album = True
+                    except Exception:
+                        sent_as_album = False
+
+                if sent_as_album:
+                    pass
+                elif old_arch_id:
                     try:
                         if len(full_caption) > 1024:
                             raise ValueError("too long")
