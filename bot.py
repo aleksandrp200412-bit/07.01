@@ -1591,37 +1591,6 @@ async def handle_edit(edited_msg: types.Message):
                 else:
                     await bot.send_message(owner_id, f"{header}\n\n<b>Было:</b> [медиа]{caption_diff}", parse_mode="HTML")
 
-                try:
-                    new_arch_id = None
-                    if edited_msg.photo:
-                        new_copy = await bot.send_photo(COMMON_WAREHOUSE, edited_msg.photo[-1].file_id)
-                    elif edited_msg.video:
-                        new_copy = await bot.send_video(COMMON_WAREHOUSE, edited_msg.video.file_id)
-                    elif edited_msg.document:
-                        new_copy = await bot.send_document(COMMON_WAREHOUSE, edited_msg.document.file_id)
-                    elif edited_msg.voice:
-                        new_copy = await bot.send_voice(COMMON_WAREHOUSE, edited_msg.voice.file_id)
-                    elif edited_msg.audio:
-                        new_copy = await bot.send_audio(COMMON_WAREHOUSE, edited_msg.audio.file_id)
-                    elif edited_msg.sticker:
-                        new_copy = await bot.send_sticker(COMMON_WAREHOUSE, edited_msg.sticker.file_id)
-                    elif edited_msg.animation:
-                        new_copy = await bot.send_animation(COMMON_WAREHOUSE, edited_msg.animation.file_id)
-                    elif edited_msg.video_note:
-                        new_copy = await bot.send_video_note(COMMON_WAREHOUSE, edited_msg.video_note.file_id)
-                    else:
-                        new_copy = await bot.copy_message(chat_id=COMMON_WAREHOUSE, from_chat_id=edited_msg.chat.id, message_id=edited_msg.message_id)
-                    
-                    new_arch_id = new_copy.message_id
-                    
-                    try:
-                        await bot.copy_message(chat_id=owner_id, from_chat_id=COMMON_WAREHOUSE, message_id=new_arch_id, caption=f"<b>Стало:</b>", parse_mode="HTML")
-                    except Exception:
-                        copied = await bot.forward_message(chat_id=owner_id, from_chat_id=COMMON_WAREHOUSE, message_id=new_arch_id)
-                        await bot.send_message(owner_id, f"<b>Стало:</b>", reply_to_message_id=copied.message_id, parse_mode="HTML")
-                except Exception:
-                    pass
-
             else:
                 new_text = html.escape(edited_msg.text or edited_msg.caption or "[Медиа]")
                 old_text_esc = html.escape(old_text or "")
