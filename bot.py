@@ -5,7 +5,7 @@ import io
 import os
 import random
 import html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -27,6 +27,18 @@ ADMIN_ID = 5127534911
 COMMON_WAREHOUSE = -1003837122752
 LOGS_CHAT_ID = -5202749474
 PHOTO_FILE_ID = "https://ibb.co/CsnLs52m"
+
+# Русские алиасы пользовательских команд -> внутренние (английские) имена
+COMMAND_ALIASES = {
+    ".один": ".one",
+    ".спам": ".spam",
+    ".ввод": ".type",
+    ".печатать": ".print",
+    ".бежать": ".run",
+    ".❤️": ".heart",
+    ".загрузка": ".load",
+    ".исчезни": ".dsp",
+}
 
 # Хранилище для одноразовых сообщений: {message_id: "секретный текст"}
 one_time_messages = {}
@@ -59,6 +71,10 @@ def init_dbs():
         (owner_id INTEGER, allowed_id INTEGER, PRIMARY KEY(owner_id, allowed_id))''')
     c.execute('''CREATE TABLE IF NOT EXISTS mystats_disabled
         (user_id INTEGER PRIMARY KEY)''')
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN connected INTEGER DEFAULT 1")
+    except Exception:
+        pass
     c.execute("INSERT OR IGNORE INTO settings VALUES ('trial_active', '0')")
     conn.commit()
     conn.close()
@@ -74,6 +90,8 @@ def init_dbs():
             c.execute(f"ALTER TABLE messages_v2 ADD COLUMN {_col} {_type}")
         except Exception:
             pass
+    c.execute('''CREATE TABLE IF NOT EXISTS mod_events
+        (owner_id INTEGER, from_user_id INTEGER, from_user_name TEXT, kind TEXT, date TEXT)''')
     c.execute("DROP INDEX IF EXISTS idx_msg_v2")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_v2 ON messages_v2(id, chat_id, owner_id)")
     
@@ -110,12 +128,35 @@ def register_owner(user_id, username):
     clean_name = username.replace("@", "") if username else None
     c.execute("SELECT reg_date FROM users WHERE user_id = ?", (user_id,))
     if not c.fetchone():
-        c.execute("INSERT INTO users (user_id, username, sub_type, reg_date) VALUES (?, ?, 'none', ?)",
+        c.execute("INSERT INTO users (user_id, username, sub_type, reg_date, connected) VALUES (?, ?, 'none', ?, 1)",
                   (user_id, clean_name, datetime.now().isoformat()))
     else:
-        c.execute("UPDATE users SET username = ? WHERE user_id = ?", (clean_name, user_id))
+        c.execute("UPDATE users SET username = ?, connected = 1 WHERE user_id = ?", (clean_name, user_id))
     conn.commit()
     conn.close()
+
+
+def set_connected(user_id, is_connected):
+    try:
+        conn = sqlite3.connect('config.db')
+        c = conn.cursor()
+        c.execute("UPDATE users SET connected = ? WHERE user_id = ?", (1 if is_connected else 0, user_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def record_mod_event(owner_id, from_user_id, from_user_name, kind):
+    try:
+        conn = sqlite3.connect('spy_bot.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO mod_events (owner_id, from_user_id, from_user_name, kind, date) VALUES (?, ?, ?, ?, ?)",
+                  (owner_id, from_user_id, from_user_name, kind, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def is_ignored(owner_id, target_id):
@@ -398,8 +439,8 @@ async def cb_menu_spam(call: types.CallbackQuery):
     spam_text = (
         "💥<b>Вкладка: Спам</b>\n\n"
         "Данные команды работают исключительно в ваших личных бизнес-переписках:\n\n"
-        "<code>.spam число текст</code> — Отправляет указанный текст заданное количество раз (Максимум: 30).\n"
-        "<i>Пример: .spam 5 Привет!</i>"
+        "<code>.спам число текст</code> — Отправляет указанный текст заданное количество раз (Максимум: 30).\n"
+        "<i>Пример: .спам 5 Привет!</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Назад", callback_data="menu_back")]
@@ -413,12 +454,12 @@ async def cb_menu_anim(call: types.CallbackQuery):
     anim_text = (
         "✨ <b>Вкладка: Анимации текста</b>\n\n"
         "Интерактивные селф-анимации для ваших чатов:\n\n"
-        "<code>.type текст</code> — Посимвольная печать сообщения\n"
-        "<code>.print текст</code> — Эффект пишущей печатной машинки\n"
-        "<code>.run текст</code> — Бегущая строка из вашего текста\n"
-        "<code>.heart</code> — Красивая анимация бьющегося сердечка\n"
-        "<code>.load текст</code> — Имитация полосы загрузки перед выводом текста\n"
-        "<code>.dsp текст</code> — Текст, который постепенно исчезает"
+        "<code>.ввод текст</code> — Посимвольная печать сообщения\n"
+        "<code>.печатать текст</code> — Эффект пишущей печатной машинки\n"
+        "<code>.бежать текст</code> — Бегущая строка из вашего текста\n"
+        "<code>.❤️</code> — Красивая анимация бьющегося сердечка\n"
+        "<code>.загрузка текст</code> — Имитация полосы загрузки перед выводом текста\n"
+        "<code>.исчезни текст</code> — Текст, который постепенно исчезает"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Назад", callback_data="menu_back")]
@@ -432,9 +473,9 @@ async def cb_menu_one_time(call: types.CallbackQuery):
     one_time_text = (
         "💣 <b>Одноразовые сообщения</b>\n\n"
         "Отправляй секретные сообщения, которые исчезают.\n\n"
-        "➡️ <b>Команда 1:</b> <code>.one [текст]</code>\n"
+        "➡️ <b>Команда 1:</b> <code>.один [текст]</code>\n"
         "Текст скрывается под кнопкой и удаляется после первого просмотра.\n"
-        "<i>Пример: .one секрет</i>\n\n"
+        "<i>Пример: .один секрет</i>\n\n"
         "➡️ <b>Команда 2:</b> <code>.one1 [текст]</code>\n"
         "Отправляет сгорающее фото, где текст скрыт под спойлером. Автоматически удаляется через несколько секунд (зависит от длины текста).\n"
         "<i>Пример: .one1 секретный текст</i>"
@@ -460,15 +501,15 @@ async def cmd_help(message: types.Message):
         "• <code>/mystatsstart</code> — Включить еженедельную статистику\n"
         "• <code>.огонь</code> — Отправить приглашение на создание серии\n"
         "• <code>.живи</code> — Восстановить потухший огонёк (пишут оба)\n"
-        "• <code>.one текст</code> — Одноразовое текстовое сообщение\n"
+        "• <code>.один текст</code> — Одноразовое текстовое сообщение\n"
         "• <code>.one1 текст</code> — Сгорающее фото со спойлером\n"
-        "• <code>.spam число текст</code> — Спам сообщениями в бизнес-чате\n"
-        "• <code>.type текст</code> — Анимация: посимвольный ввод\n"
-        "• <code>.print текст</code> — Анимация: печатная машинка\n"
-        "• <code>.run текст</code> — Анимация: бегущая строка\n"
-        "• <code>.heart</code> — Анимация: бьющееся сердце\n"
-        "• <code>.load текст</code> — Анимация: полоса загрузки\n"
-        "• <code>.dsp текст</code> — Анимация: исчезающий текст\n"
+        "• <code>.спам число текст</code> — Спам сообщениями в бизнес-чате\n"
+        "• <code>.ввод текст</code> — Анимация: посимвольный ввод\n"
+        "• <code>.печатать текст</code> — Анимация: печатная машинка\n"
+        "• <code>.бежать текст</code> — Анимация: бегущая строка\n"
+        "• <code>.❤️</code> — Анимация: бьющееся сердце\n"
+        "• <code>.загрузка текст</code> — Анимация: полоса загрузки\n"
+        "• <code>.исчезни текст</code> — Анимация: исчезающий текст\n"
     )
     if message.from_user.id == ADMIN_ID:
         help_text += (
@@ -626,10 +667,10 @@ async def cmd_stats(message: types.Message):
     conn_c = sqlite3.connect('config.db')
     c_c = conn_c.cursor()
     c_c.execute(
-        "SELECT COUNT(*), COUNT(CASE WHEN sub_type='paid' THEN 1 END), COUNT(CASE WHEN sub_type='free' THEN 1 END), COUNT(CASE WHEN sub_type='none' THEN 1 END) FROM users")
+        "SELECT COUNT(*), COUNT(CASE WHEN sub_type='paid' THEN 1 END), COUNT(CASE WHEN sub_type='free' THEN 1 END), COUNT(CASE WHEN sub_type='none' THEN 1 END) FROM users WHERE connected = 1")
     total_u, paid_u, free_u, none_u = c_c.fetchone()
     
-    c_c.execute("SELECT username, sub_type, user_id, reg_date FROM users ORDER BY reg_date DESC")
+    c_c.execute("SELECT username, sub_type, user_id, reg_date FROM users WHERE connected = 1 ORDER BY reg_date DESC")
     users_list = c_c.fetchall()
     
     conn_s = sqlite3.connect('spy_bot.db')
@@ -1059,6 +1100,8 @@ async def check_fire_status_loop():
 async def handle_conn(connection: types.BusinessConnection):
     if connection.is_enabled:
         register_owner(connection.user.id, connection.user.username)
+    else:
+        set_connected(connection.user.id, False)
 
 
 @dp.business_message()
@@ -1121,6 +1164,7 @@ async def handle_new(message: types.Message):
             full_text = message.text.strip()
             parts = full_text.split(maxsplit=2)
             cmd = parts[0].lower()
+            cmd = COMMAND_ALIASES.get(cmd, cmd)
 
             if cmd in [".spam", ".type", ".print", ".run", ".heart", ".load", ".dsp", ".one", ".one1", ".огонь", ".живи", ".расти", ".умри", ".почти"]:
                 if message.from_user.id == owner_id:
@@ -1589,6 +1633,7 @@ async def handle_edit(edited_msg: types.Message):
         if is_liza_blocked(owner_id): return
         if is_user_blocked(owner_id, from_user_id): return
         if is_fuck_blocked(owner_id, from_user_id): return
+        record_mod_event(owner_id, from_user_id, from_name, "edit")
         try:
             safe_name = html.escape(from_name or "Собеседник")
             safe_tag = html.escape(from_tag or "")
@@ -1668,7 +1713,7 @@ async def build_stats_for(owner_id: int) -> str | None:
                 top_contact = await cur.fetchone()
 
             async with db.execute("""
-                SELECT from_user_name, COUNT(*) as cnt FROM messages_v2
+                SELECT from_user_name, COUNT(*) as cnt FROM mod_events
                 WHERE owner_id = ? AND from_user_id != ? AND date >= ?
                 GROUP BY from_user_id ORDER BY cnt DESC LIMIT 1
             """, (owner_id, owner_id, week_ago)) as cur:
@@ -1718,31 +1763,40 @@ async def build_stats_for(owner_id: int) -> str | None:
         return None
 
 
+MSK_TZ = timezone(timedelta(hours=3))
+
+
 async def send_weekly_stats():
     while True:
-        now = datetime.now()
-        days_until_monday = (7 - now.weekday()) % 7 or 7
-        next_monday = (now + timedelta(days=days_until_monday)).replace(hour=9, minute=0, second=0, microsecond=0)
-        await asyncio.sleep((next_monday - now).total_seconds())
+        try:
+            now = datetime.now(MSK_TZ)
+            days_until_monday = (7 - now.weekday()) % 7
+            next_monday = (now + timedelta(days=days_until_monday)).replace(hour=10, minute=0, second=0, microsecond=0)
+            if next_monday <= now:
+                next_monday += timedelta(days=7)
+            await asyncio.sleep((next_monday - now).total_seconds())
 
-        conn_c = sqlite3.connect('config.db')
-        c_c = conn_c.cursor()
-        c_c.execute("SELECT user_id FROM users")
-        owners = [r[0] for r in c_c.fetchall()]
-        c_c.execute("SELECT user_id FROM mystats_disabled")
-        disabled = {r[0] for r in c_c.fetchall()}
-        conn_c.close()
+            conn_c = sqlite3.connect('config.db')
+            c_c = conn_c.cursor()
+            c_c.execute("SELECT user_id FROM users")
+            owners = [r[0] for r in c_c.fetchall()]
+            c_c.execute("SELECT user_id FROM mystats_disabled")
+            disabled = {r[0] for r in c_c.fetchall()}
+            conn_c.close()
 
-        for owner_id in owners:
-            if owner_id in disabled:
-                continue
-            try:
-                text = await build_stats_for(owner_id)
-                if text:
-                    await bot.send_message(owner_id, text)
-                await asyncio.sleep(0.05)
-            except Exception:
-                pass
+            for owner_id in owners:
+                if owner_id in disabled:
+                    continue
+                try:
+                    text = await build_stats_for(owner_id)
+                    if text:
+                        await bot.send_message(owner_id, text)
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("send_weekly_stats: ошибка цикла, повтор через 60с")
+            await asyncio.sleep(60)
 
 
 # --- УДАЛЕНИЕ / ОЧИСТКА ЧАТА СОБЕСЕДНИКОМ ---
@@ -1841,6 +1895,7 @@ async def _notify_deleted_message(actor_id, peer_id, msg_id):
         return
     if text and text.strip().startswith('.'):
         return
+    record_mod_event(actor_id, from_user_id, from_name, "delete")
     header = f"👤 <b>{html.escape(from_name or 'Собеседник')}</b> {html.escape(from_tag or '')} удалил(а) сообщение:"
     quote = f"\n\n<blockquote>{html.escape(text)}</blockquote>" if text and text != "[Медиа]" else ""
     caption = header + quote
