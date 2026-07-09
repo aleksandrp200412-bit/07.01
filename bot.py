@@ -1571,8 +1571,8 @@ async def handle_edit(edited_msg: types.Message):
                 new_caption = html.escape(edited_msg.caption or "")
                 caption_diff = ""
                 if old_caption or new_caption:
-                    caption_diff = (f"\n\n<b>Подпись было:</b> <blockquote>{old_caption or '—'}</blockquote>"
-                                    f"\n<b>Подпись стало:</b> <blockquote>{new_caption or '—'}</blockquote>")
+                    caption_diff = (f"\n\n<b>Подпись была:</b> <blockquote>{old_caption or '—'}</blockquote>"
+                                    f"\n<b>Подпись стала:</b> <blockquote>{new_caption or '—'}</blockquote>")
 
                 full_caption = f"{header}{caption_diff}"
 
