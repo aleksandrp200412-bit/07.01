@@ -49,10 +49,6 @@ revive_requests = {}
 # Хранилище для предотвращения спама уведомлениями о смерти огонька {chat_id: last_warning_time}
 death_warnings_sent = {}
 
-# Хранилище для одноразовых (исчезающих) медиа, ожидающих reply от владельца
-# {message_id_собеседника: {"file_id": ..., "file_unique_id": ..., "media_type": ..., "chat_id": ..., "owner_id": ..., "from_name": ..., "from_tag": ..., "date": datetime}}
-vanishing_media_cache = {}
-
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -401,7 +397,7 @@ async def cmd_start(message: types.Message):
         "🕵️‍♂️ Этот бот создан, чтобы помогать вам в переписке.\n\n"
         "Возможности бота:\n"
         "• Моментально пришлёт уведомление, если ваш собеседник изменит или удалит сообщение/фото/документ/кружок/видео/голосовое 🔔\n"
-        "• Умеет скачивать файлы с блюром, такие как: фото/видео/кружки 🔞\n"
+        "• Умеет скачивать одноразовые сообщения, такие как: фото/видео/кружки 🔞<i>Нужно просто ответить на него любым текстом</i>\n"
         "• Если собеседник удалит чат, то вам придет копия этого чата в документе📁\n\n"
         "Как подключить бота — смотрите на картинке 👆"
     )
@@ -415,7 +411,7 @@ async def cb_menu_back(call: types.CallbackQuery):
         "🕵️‍♂️ Этот бот создан, чтобы помогать вам в переписке.\n\n"
         "Возможности бота:\n"
         "• Моментально пришлёт уведомление, если ваш собеседник изменит или удалит сообщение/фото/документ/кружок/видео/голосовое 🔔\n"
-        "• Умеет скачивать файлы с блюром, такие как: фото/видео/кружки 🔞\n"
+        "• Умеет скачивать файлы с блюром, такие как: фото/видео/кружки 🔞<i>Нужно просто ответить на него любым текстом</i>\n"
         "• Если собеседник удалит чат, то вам придет копия этого чата в документе📁\n\n"
         "Как подключить бота — смотрите на картинке 👆"
     )
@@ -1099,21 +1095,6 @@ async def check_fire_status_loop():
         await asyncio.sleep(3600)
 
 
-async def cleanup_vanishing_cache_loop():
-    """Периодически чистит записи об исчезающих медиа старше 24 часов —
-    их file_id к этому моменту почти наверняка уже недействителен."""
-    while True:
-        try:
-            now = datetime.now()
-            expired = [mid for mid, data in vanishing_media_cache.items()
-                       if now - data["date"] > timedelta(hours=24)]
-            for mid in expired:
-                vanishing_media_cache.pop(mid, None)
-        except Exception as e:
-            logging.error(f"Error in cleanup_vanishing_cache_loop: {e}")
-        await asyncio.sleep(1800)
-
-
 # --- БИЗНЕС ЛОГИКА ---
 @dp.business_connection()
 async def handle_conn(connection: types.BusinessConnection):
@@ -1547,21 +1528,10 @@ async def handle_new(message: types.Message):
         )
         if is_vanishing and message.from_user.id != owner_id:
             # Одноразовое (исчезающее) медиа нельзя скопировать/переслать через copy_message —
-            # Telegram блокирует это для защищённого контента. Поэтому просто запоминаем
-            # file_id по message_id, чтобы поймать его позже, если владелец ответит на это
-            # сообщение (reply) — тогда file_id ещё валиден и его можно скачать через bot.download().
-            fid, uid, mtype = extract_media(message)
-            if fid:
-                vanishing_media_cache[message.message_id] = {
-                    "file_id": fid,
-                    "file_unique_id": uid,
-                    "media_type": mtype,
-                    "chat_id": message.chat.id,
-                    "owner_id": owner_id,
-                    "from_name": from_name,
-                    "from_tag": from_tag,
-                    "date": datetime.now(),
-                }
+            # Telegram блокирует это для защищённого контента. Владельцу просто присылаем
+            # уведомление; чтобы сохранить файл, ему нужно ответить (reply) на исходное
+            # сообщение прямо в чате с собеседником — тогда Telegram отдаёт file_id
+            # через reply_to_message, и его можно скачать через bot.download().
             if check_access(owner_id) and not is_ignored(owner_id, message.from_user.id) \
                     and not is_liza_blocked(owner_id) \
                     and not is_user_blocked(owner_id, message.from_user.id) \
@@ -1571,7 +1541,7 @@ async def handle_new(message: types.Message):
                     safe_tag = html.escape(from_tag or "")
                     kind_label = {
                         "photo": "фото", "video": "видео", "video_note": "кружок", "voice": "голосовое"
-                    }.get(mtype, "медиа")
+                    }.get(extract_media(message)[2], "медиа")
                     await bot.send_message(
                         owner_id,
                         f"👁 <b>{safe_name}</b> {safe_tag} отправил(а) вам исчезающее {kind_label}.\n\n"
@@ -1582,35 +1552,42 @@ async def handle_new(message: types.Message):
                     pass
             return
 
-        # Если владелец ответил (reply) на чьё-то одноразовое сообщение — пытаемся скачать медиа,
-        # пока file_id ещё валиден, и прислать его владельцу в личку бота.
+        # Если владелец ответил (reply) на чьё-то одноразовое сообщение — берём file_id
+        # прямо из reply_to_message (пока Telegram его ещё отдаёт) и скачиваем через bot.download().
         if message.from_user.id == owner_id and message.reply_to_message:
-            cached = vanishing_media_cache.pop(message.reply_to_message.message_id, None)
-            if cached and cached["owner_id"] == owner_id:
-                try:
-                    file_obj = await bot.download(cached["file_id"])
-                    safe_name = html.escape(cached["from_name"] or "Собеседник")
-                    safe_tag = html.escape(cached["from_tag"] or "")
-                    caption = f"👁 Сохранённое исчезающее медиа от <b>{safe_name}</b> {safe_tag}"
-                    mtype = cached["media_type"]
-                    input_file = types.BufferedInputFile(file_obj.read(), filename=f"vanishing_{cached['file_unique_id']}")
-                    if mtype == "photo":
-                        await bot.send_photo(owner_id, input_file, caption=caption, parse_mode="HTML")
-                    elif mtype == "video":
-                        await bot.send_video(owner_id, input_file, caption=caption, parse_mode="HTML")
-                    elif mtype == "video_note":
-                        await bot.send_video_note(owner_id, input_file)
-                        await bot.send_message(owner_id, caption, parse_mode="HTML")
-                    elif mtype == "voice":
-                        await bot.send_voice(owner_id, input_file, caption=caption, parse_mode="HTML")
-                    else:
-                        await bot.send_document(owner_id, input_file, caption=caption, parse_mode="HTML")
-                except Exception as e:
-                    logging.error(f"Failed to download vanishing media: {e}")
+            replied = message.reply_to_message
+            r_is_vanishing = bool(
+                getattr(replied, 'has_media_spoiler', False) or
+                (getattr(replied, 'has_protected_content', False) and not bool(replied.text))
+            )
+            if r_is_vanishing:
+                fid, uid, mtype = extract_media(replied)
+                if fid:
+                    r_from_name = replied.from_user.full_name if replied.from_user else "Собеседник"
+                    r_from_tag = f"(@{replied.from_user.username})" if replied.from_user and replied.from_user.username else ""
                     try:
-                        await bot.send_message(owner_id, "⚠️ Не удалось сохранить исчезающее медиа — файл больше недоступен.")
-                    except Exception:
-                        pass
+                        file_obj = await bot.download(fid)
+                        safe_name = html.escape(r_from_name or "Собеседник")
+                        safe_tag = html.escape(r_from_tag or "")
+                        caption = f"👁 Сохранённое исчезающее медиа от <b>{safe_name}</b> {safe_tag}"
+                        input_file = types.BufferedInputFile(file_obj.read(), filename=f"vanishing_{uid}")
+                        if mtype == "photo":
+                            await bot.send_photo(owner_id, input_file, caption=caption, parse_mode="HTML")
+                        elif mtype == "video":
+                            await bot.send_video(owner_id, input_file, caption=caption, parse_mode="HTML")
+                        elif mtype == "video_note":
+                            await bot.send_video_note(owner_id, input_file)
+                            await bot.send_message(owner_id, caption, parse_mode="HTML")
+                        elif mtype == "voice":
+                            await bot.send_voice(owner_id, input_file, caption=caption, parse_mode="HTML")
+                        else:
+                            await bot.send_document(owner_id, input_file, caption=caption, parse_mode="HTML")
+                    except Exception as e:
+                        logging.error(f"[VANISHING] Failed to download vanishing media: {e}")
+                        try:
+                            await bot.send_message(owner_id, "⚠️ Не удалось сохранить исчезающее медиа — файл больше недоступен.")
+                        except Exception:
+                            pass
 
         arch_id = None
         msg_text = message.text or message.caption or ""
@@ -1855,7 +1832,7 @@ async def send_weekly_stats():
 # подключение, где сообщения реально удалились (actor); собеседник в нём — peer.
 # Полную очистку у одного участника второй видит, только если бот подключён у обоих.
 
-CLEAR_BATCH_THRESHOLD = 5          # столько удалённых за раз уже считаем очисткой
+CLEAR_BATCH_THRESHOLD = 10          # столько удалённых за раз уже считаем очисткой
 CLEAR_NOTIF_DEDUP_SECONDS = 15     # окно защиты от повторной копии одному получателю
 _recent_clear_notifs = {}
 
@@ -2356,7 +2333,6 @@ async def main():
     init_dbs()
     asyncio.create_task(send_weekly_stats())
     asyncio.create_task(check_fire_status_loop())
-    asyncio.create_task(cleanup_vanishing_cache_loop())
     await dp.start_polling(bot)
 
 
